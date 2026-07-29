@@ -1,131 +1,98 @@
-#include <iostream>
 #include <atomic>
-#include <vector>
-#include <thread>
-#include <random>
-#include <chrono>
-#include <cassert>
 #include <memory>
-#include <limits>
+#include <random>
+#include <vector>
+#include <optional>
 
-constexpr int MAX_LEVEL = 16;
-constexpr float PROBABILITY = 0.5f;
-
-template <typename T>
-T* get_unmarked(T* ptr) {
-    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(ptr) & ~static_cast<uintptr_t>(1));
-}
-
-template <typename T>
-T* get_marked(T* ptr) {
-    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(ptr) | static_cast<uintptr_t>(1));
-}
-
-template <typename T>
-bool is_marked(T* ptr) {
-    return (reinterpret_cast<uintptr_t>(ptr) & 1) != 0;
-}
-
-struct Node {
-    int key;
-    int value;
-    int height;
-    std::atomic<Node*> next[MAX_LEVEL];
-
-    Node(int k, int v, int h) : key(k), value(v), height(h) {
-        for (int i = 0; i < MAX_LEVEL; ++i) {
-            next[i].store(nullptr, std::memory_order_relaxed);
-        }
-    }
-};
-
-class EpochManager {
-private:
-    static constexpr int MAX_THREADS = 64;
-    std::atomic<uint64_t> global_epoch{0};
-    std::atomic<uint64_t> active_epochs[MAX_THREADS];
-    std::vector<Node*> retire_lists[MAX_THREADS];
-
-public:
-    EpochManager() {
-        for (int i = 0; i < MAX_THREADS; ++i) {
-            active_epochs[i].store(UINT64_MAX, std::memory_order_relaxed);
-        }
-    }
-
-    void enter_epoch(int thread_id) {
-        uint64_t e = global_epoch.load(std::memory_order_relaxed);
-        active_epochs[thread_id].store(e, std::memory_order_seq_cst);
-    }
-
-    void leave_epoch(int thread_id) {
-        active_epochs[thread_id].store(UINT64_MAX, std::memory_order_release);
-        try_reclaim(thread_id);
-    }
-
-    void retire(Node* node, int thread_id) {
-        retire_lists[thread_id].push_back(node);
-        if (retire_lists[thread_id].size() >= 32) {
-            try_reclaim(thread_id);
-        }
-    }
-
-    void try_reclaim(int thread_id) {
-        uint64_t min_epoch = global_epoch.load(std::memory_order_relaxed);
-        for (int i = 0; i < MAX_THREADS; ++i) {
-            uint64_t e = active_epochs[i].load(std::memory_order_acquire);
-            if (e < min_epoch) {
-                min_epoch = e;
-            }
-        }
-
-        auto& list = retire_lists[thread_id];
-        auto it = list.begin();
-        while (it != list.end()) {
-            delete *it;
-            it = list.erase(it);
-        }
-        global_epoch.fetch_add(1, std::memory_order_relaxed);
-    }
-};
-
-static EpochManager g_epoch_mgr;
-
+template <typename K, typename V, size_t MaxLevel = 16>
 class LockFreeSkipList {
 private:
+    struct MarkablePointer {
+        uintptr_t value;
+
+        MarkablePointer(void* ptr = nullptr, bool mark = false) {
+            value = reinterpret_cast<uintptr_t>(ptr) | (mark ? 1 : 0);
+        }
+
+        void* get_ptr() const {
+            return reinterpret_cast<void*>(value & ~uintptr_t(1));
+        }
+
+        bool is_marked() const {
+            return (value & 1) != 0;
+        }
+    };
+
+    struct Node {
+        K key;
+        V val;
+        int level;
+        std::atomic<MarkablePointer> next[MaxLevel];
+
+        Node(const K& k, const V& v, int lvl) : key(k), val(v), level(lvl) {
+            for (int i = 0; i < MaxLevel; ++i) {
+                next[i].store(MarkablePointer(nullptr, false), std::memory_order_relaxed);
+            }
+        }
+    };
+
+    class EpochManager {
+        std::atomic<uint64_t> global_epoch{0};
+        struct ThreadLocalState {
+            std::atomic<uint64_t> local_epoch{UINT64_MAX};
+            std::vector<Node*> limbo;
+        };
+        
+        static thread_local ThreadLocalState tls;
+        std::vector<ThreadLocalState*> registered_threads;
+
+    public:
+        void enter() {
+            tls.local_epoch.store(global_epoch.load(std::memory_order_relaxed), std::memory_order_seq_cst);
+        }
+
+        void leave() {
+            tls.local_epoch.store(UINT64_MAX, std::memory_order_release);
+            reclaim();
+        }
+
+        void retire(Node* node) {
+            tls.limbo.push_back(node);
+        }
+
+    private:
+        void reclaim() {
+            if (tls.limbo.empty()) return;
+            
+            uint64_t min_epoch = global_epoch.load(std::memory_order_relaxed);
+            for (auto* t : registered_threads) {
+                uint64_t e = t->local_epoch.load(std::memory_order_acquire);
+                if (e < min_epoch) min_epoch = e;
+            }
+
+            auto it = tls.limbo.begin();
+            while (it != tls.limbo.end()) {
+                delete *it;
+                it = tls.limbo.erase(it);
+            }
+        }
+    };
+
     Node* head;
     Node* tail;
+    EpochManager epoch_mgr;
 
-    int random_level(thread_local std::mt19937& rng) {
+    int random_level() {
+        static thread_local std::mt19937 gen(std::random_device{}());
+        std::uniform_int_distribution<int> dist(0, 1);
         int lvl = 1;
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        while (dist(rng) < PROBABILITY && lvl < MAX_LEVEL) {
+        while (dist(gen) && lvl < static_cast<int>(MaxLevel)) {
             lvl++;
         }
         return lvl;
     }
 
-public:
-    LockFreeSkipList() {
-        head = new Node(std::numeric_limits<int>::min(), 0, MAX_LEVEL);
-        tail = new Node(std::numeric_limits<int>::max(), 0, MAX_LEVEL);
-        for (int i = 0; i < MAX_LEVEL; ++i) {
-            head->next[i].store(tail, std::memory_order_relaxed);
-        }
-    }
-
-    ~LockFreeSkipList() {
-        Node* curr = get_unmarked(head->next[0].load(std::memory_order_relaxed));
-        while (curr != tail && curr != nullptr) {
-            Node* next = get_unmarked(curr->next[0].load(std::memory_order_relaxed));
-            delete curr;
-            curr = next;
-        }
-        delete head;
-        delete tail;
-    }
-
-    bool find_pos(int key, Node** preds, Node** succs) {
+    bool find(const K& key, Node** preds, Node** succs) {
         bool marked = false;
         Node* pred = nullptr;
         Node* curr = nullptr;
@@ -133,23 +100,34 @@ public:
 
     retry:
         pred = head;
-        for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            curr = pred->next[i].load(std::memory_order_acquire);
+        for (int i = static_cast<int>(MaxLevel) - 1; i >= 0; --i) {
+            auto curr_mp = pred->next[i].load(std::memory_order_acquire);
+            curr = static_cast<Node*>(curr_mp.get_ptr());
+
             while (true) {
-                succ = curr->next[i].load(std::memory_order_acquire);
-                marked = is_marked(succ);
+                if (!curr) break;
+                auto succ_mp = curr->next[i].load(std::memory_order_acquire);
+                succ = static_cast<Node*>(succ_mp.get_ptr());
+                marked = succ_mp.is_marked();
+
                 while (marked) {
-                    bool snip = pred->next[i].compare_exchange_weak(
-                        curr, get_unmarked(succ),
-                        std::memory_order_release, std::memory_order_relaxed);
-                    if (!snip) goto retry;
-                    curr = get_unmarked(succ);
-                    succ = curr->next[i].load(std::memory_order_acquire);
-                    marked = is_marked(succ);
+                    MarkablePointer expected(curr, false);
+                    MarkablePointer desired(succ, false);
+                    if (!pred->next[i].compare_exchange_strong(expected, desired,
+                                                              std::memory_order_acq_rel,
+                                                              std::memory_order_relaxed)) {
+                        goto retry;
+                    }
+                    curr = succ;
+                    if (!curr) break;
+                    succ_mp = curr->next[i].load(std::memory_order_acquire);
+                    succ = static_cast<Node*>(succ_mp.get_ptr());
+                    marked = succ_mp.is_marked();
                 }
-                if (get_unmarked(curr)->key < key) {
-                    pred = get_unmarked(curr);
-                    curr = get_unmarked(succ);
+
+                if (curr && curr->key < key) {
+                    pred = curr;
+                    curr = succ;
                 } else {
                     break;
                 }
@@ -157,169 +135,137 @@ public:
             preds[i] = pred;
             succs[i] = curr;
         }
-        return (get_unmarked(curr)->key == key);
+
+        return (curr != nullptr && curr->key == key);
     }
 
-    bool insert(int key, int val, int thread_id) {
-        g_epoch_mgr.enter_epoch(thread_id);
-        thread_local std::mt19937 rng(1337 + thread_id);
-        int top_level = random_level(rng);
-        Node* preds[MAX_LEVEL];
-        Node* succs[MAX_LEVEL];
+public:
+    LockFreeSkipList() {
+        head = new Node(K{}, V{}, MaxLevel);
+        tail = new Node(K{}, V{}, MaxLevel);
+        for (size_t i = 0; i < MaxLevel; ++i) {
+            head->next[i].store(MarkablePointer(tail, false), std::memory_order_relaxed);
+        }
+    }
+
+    ~LockFreeSkipList() {
+        Node* curr = static_cast<Node*>(head->next[0].load().get_ptr());
+        while (curr && curr != tail) {
+            Node* next = static_cast<Node*>(curr->next[0].load().get_ptr());
+            delete curr;
+            curr = next;
+        }
+        delete head;
+        delete tail;
+    }
+
+    bool insert(const K& key, const V& val) {
+        int top_level = random_level();
+        Node* preds[MaxLevel];
+        Node* succs[MaxLevel];
+
+        epoch_mgr.enter();
 
         while (true) {
-            if (find_pos(key, preds, succs)) {
-                g_epoch_mgr.leave_epoch(thread_id);
-                return false; 
+            if (find(key, preds, succs)) {
+                epoch_mgr.leave();
+                return false;
             }
 
             Node* new_node = new Node(key, val, top_level);
             for (int i = 0; i < top_level; ++i) {
-                new_node->next[i].store(succs[i], std::memory_order_relaxed);
+                new_node->next[i].store(MarkablePointer(succs[i], false), std::memory_order_relaxed);
             }
 
-            Node* pred = preds[0];
-            Node* succ = succs[0];
-            if (!pred->next[0].compare_exchange_weak(succ, new_node, std::memory_order_release, std::memory_order_relaxed)) {
+            MarkablePointer expected(succs[0], false);
+            MarkablePointer desired(new_node, false);
+
+            if (!preds[0]->next[0].compare_exchange_strong(expected, desired,
+                                                           std::memory_order_release,
+                                                           std::memory_order_relaxed)) {
                 delete new_node;
                 continue;
             }
 
             for (int i = 1; i < top_level; ++i) {
                 while (true) {
-                    pred = preds[i];
-                    succ = succs[i];
-                    new_node->next[i].store(succ, std::memory_order_relaxed);
-                    if (pred->next[i].compare_exchange_weak(succ, new_node, std::memory_order_release, std::memory_order_relaxed)) {
+                    MarkablePointer exp(succs[i], false);
+                    MarkablePointer des(new_node, false);
+                    if (preds[i]->next[i].compare_exchange_strong(exp, des,
+                                                                  std::memory_order_release,
+                                                                  std::memory_order_relaxed)) {
                         break;
                     }
-                    find_pos(key, preds, succs);
+                    find(key, preds, succs);
                 }
             }
 
-            g_epoch_mgr.leave_epoch(thread_id);
+            epoch_mgr.leave();
             return true;
         }
     }
 
-    bool remove(int key, int thread_id) {
-        g_epoch_mgr.enter_epoch(thread_id);
-        Node* preds[MAX_LEVEL];
-        Node* succs[MAX_LEVEL];
-        Node* victim = nullptr;
+    bool remove(const K& key) {
+        Node* preds[MaxLevel];
+        Node* succs[MaxLevel];
+
+        epoch_mgr.enter();
 
         while (true) {
-            if (!find_pos(key, preds, succs)) {
-                g_epoch_mgr.leave_epoch(thread_id);
+            if (!find(key, preds, succs)) {
+                epoch_mgr.leave();
                 return false;
             }
 
-            victim = succs[0];
-            for (int i = victim->height - 1; i >= 1; --i) {
-                Node* succ = victim->next[i].load(std::memory_order_relaxed);
-                while (!is_marked(succ)) {
-                    victim->next[i].compare_exchange_weak(succ, get_marked(succ), std::memory_order_release, std::memory_order_relaxed);
-                    succ = victim->next[i].load(std::memory_order_relaxed);
+            Node* victim = succs[0];
+            for (int i = victim->level - 1; i >= 1; --i) {
+                MarkablePointer expected(victim->next[i].load().get_ptr(), false);
+                MarkablePointer desired(victim->next[i].load().get_ptr(), true);
+                while (!victim->next[i].is_lock_free() && 
+                       !victim->next[i].compare_exchange_strong(expected, desired)) {
+                    expected = MarkablePointer(victim->next[i].load().get_ptr(), false);
+                    desired = MarkablePointer(victim->next[i].load().get_ptr(), true);
                 }
             }
 
-            Node* succ = victim->next[0].load(std::memory_order_relaxed);
-            while (true) {
-                bool i_marked = victim->next[0].compare_exchange_weak(succ, get_marked(succ), std::memory_order_release, std::memory_order_relaxed);
-                succ = victim->next[0].load(std::memory_order_relaxed);
-                if (i_marked) {
-                    find_pos(key, preds, succs);
-                    g_epoch_mgr.retire(victim, thread_id);
-                    g_epoch_mgr.leave_epoch(thread_id);
-                    return true;
-                } else if (is_marked(succ)) {
-                    g_epoch_mgr.leave_epoch(thread_id);
-                    return false;
-                }
+            MarkablePointer expected(victim->next[0].load().get_ptr(), false);
+            MarkablePointer desired(victim->next[0].load().get_ptr(), true);
+
+            if (victim->next[0].compare_exchange_strong(expected, desired,
+                                                         std::memory_order_acq_rel,
+                                                         std::memory_order_relaxed)) {
+                find(key, preds, succs);
+                epoch_mgr.retire(victim);
+                epoch_mgr.leave();
+                return true;
             }
         }
     }
 
-    bool search(int key, int& value_out, int thread_id) {
-        g_epoch_mgr.enter_epoch(thread_id);
-        Node* curr = head;
-        for (int i = MAX_LEVEL - 1; i >= 0; --i) {
-            Node* next = curr->next[i].load(std::memory_order_acquire);
-            while (true) {
-                Node* unmark_next = get_unmarked(next);
-                if (unmark_next->key < key) {
-                    curr = unmark_next;
-                    next = curr->next[i].load(std::memory_order_acquire);
-                } else {
-                    break;
-                }
+    std::optional<V> contains(const K& key) {
+        epoch_mgr.enter();
+        Node* pred = head;
+         Node* curr = nullptr;
+
+        for (int i = static_cast<int>(MaxLevel) - 1; i >= 0; --i) {
+            curr = static_cast<Node*>(pred->next[i].load(std::memory_order_acquire).get_ptr());
+            while (curr && curr != tail) {
+                if (curr->key >= key) break;
+                pred = curr;
+                curr = static_cast<Node*>(curr->next[i].load(std::memory_order_acquire).get_ptr());
             }
         }
 
-        curr = get_unmarked(curr->next[0].load(std::memory_order_acquire));
-        bool found = (curr->key == key && !is_marked(curr->next[0].load(std::memory_order_acquire)));
-        if (found) {
-            value_out = curr->value;
+        if (curr && curr != tail && curr->key == key) {
+            auto mp = curr->next[0].load(std::memory_order_acquire);
+            if (!mp.is_marked()) {
+                V value = curr->val;
+                epoch_mgr.leave();
+                return value;
+            }
         }
-        g_epoch_mgr.leave_epoch(thread_id);
-        return found;
+
+        epoch_mgr.leave();
+        return std::nullopt;
     }
 };
-
-void run_stress_test(int num_threads, int ops_per_thread) {
-    LockFreeSkipList list;
-    std::atomic<long> successful_ops{0};
-    std::vector<std::thread> workers;
-
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    for (int t = 0; t < num_threads; ++t) {
-        workers.emplace_back([&list, t, ops_per_thread, &successful_ops]() {
-            std::mt19937 rng(42 + t);
-            std::uniform_int_distribution<int> op_dist(0, 99);
-            std::uniform_int_distribution<int> key_dist(1, 10000);
-
-            for (int i = 0; i < ops_per_thread; ++i) {
-                int op = op_dist(rng);
-                int key = key_dist(rng);
-                int val = key * 2;
-
-                if (op < 70) { 
-                    int out_val = 0;
-                    list.search(key, out_val, t);
-                    successful_ops.fetch_add(1, std::memory_order_relaxed);
-                } else if (op < 90) { 
-                    if (list.insert(key, val, t)) {
-                        successful_ops.fetch_add(1, std::memory_order_relaxed);
-                    }
-                } else { 
-                    if (list.remove(key, t)) {
-                        successful_ops.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-            }
-        });
-    }
-
-    for (auto& w : workers) {
-        w.join();
-    }
-
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
-    double throughput = successful_ops.load() / elapsed_sec;
-
-    std::cout << "Threads: " << num_threads 
-              << " | Operations: " << successful_ops.load() 
-              << " | Time: " << elapsed_sec << "s"
-              << " | Throughput: " << throughput << " ops/sec" << std::endl;
-}
-
-int main() {
-    std::cout << "=== Lock-Free Skip List Stress Test ===" << std::endl;
-    run_stress_test(1, 1000000);
-    run_stress_test(4, 1000000);
-    run_stress_test(8, 1000000);
-    run_stress_test(16, 1000000);
-    return 0;
-}

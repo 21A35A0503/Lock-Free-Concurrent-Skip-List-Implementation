@@ -1,28 +1,11 @@
 # Lock-Free Concurrent Skip List Implementation
 
-A high-performance C++17 implementation of a lock-free concurrent skip list utilizing Harris-style logical deletion and epoch-based memory reclamation (EBM).
+## Design Decisions
 
-## Technical Overview
+* **Logical Deletion vs. Physical Cleanup**: I opted for Harris-style logical deletion using marked pointers (utilizing the lowest bit of `uintptr_t`). When `remove()` is executed, higher levels are marked bottom-up before the level 0 pointer is marked. Helper functions like `find()` complete physical unlink operations lazily during traversal.
+* **Epoch-Based Memory Management**: I chose an epoch-based garbage collector instead of hazard pointers to reduce per-read memory barriers in high-throughput workloads. Threads publish an active epoch on traversal entry and flush retired nodes to a thread-local limbo array upon exit.
 
-### System Architecture & Design
-* **Logical vs Physical Deletion**: Node removal uses pointer tagging via low-bit masking (`uintptr_t`). When a node is deleted, its pointers are marked logically first, allowing concurrent traversal threads to skip unlinked regions without blocking updates. Physical reclamation is deferred to subsequent traversals or epoch boundaries.
-* **Epoch-Based Garbage Collection**: Avoids ABA problems during concurrent node dynamic deallocations. Threads publish active epochs upon operational access, keeping unlinked pointer references safe until all concurrent readers finish their operation frame.
-* **Memory Fences & Ordering**: Optimized atomic operations using explicit acquire/release ordering constraints to avoid unnecessary global bus locks compared to default sequential consistency (`seq_cst`).
+## Edge Cases & Testing Discoveries
 
-## Benchmark Results
-
-Evaluated on an 8-core CPU across 1,000,000 operations per thread with a workload distribution of 70% Reads, 20% Inserts, and 10% Deletes.
-
-| Thread Count | Completed Ops | Time (s) | Throughput (Ops/sec) |
-| :--- | :--- | :--- | :--- |
-| **1 Thread** | 1,000,000 | 0.182 | 5,494,505 |
-| **4 Threads** | 4,000,000 | 0.221 | 18,099,547 |
-| **8 Threads** | 8,000,000 | 0.385 | 20,779,220 |
-| **16 Threads** | 16,000,000 | 0.892 | 17,937,219 |
-
-## How to Build and Run
-
-### Using GCC directly:
-```bash
-g++ -O3 -std=c++17 -pthread main.cpp -o skiplist_bench
-./skiplist_bench
+* **CAS Failure Loops under Heavy Write Contention**: Under high thread counts, repeated thread contention on level-0 CAS operations caused tail latency spikes. Relaxing memory barriers on helper link assignments (using `memory_order_relaxed` where store ordering is strictly dependent on level-0 insertion) improved overall operations-per-second.
+* **Linearizability on Concurrent Mark & Physical Removal**: A key edge case occurs when a thread attempts to read a node that has been marked at level 0, but not yet physically detached from upper levels. Check operations explicitly verify the marked bit on level 0 before returning value snapshots to guarantee linearizability.

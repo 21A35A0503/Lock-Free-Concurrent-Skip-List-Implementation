@@ -3,6 +3,7 @@
 #include <vector>
 #include <chrono>
 #include "lock_free_skip_list.hpp"
+#include "epoch_manager.hpp"
 
 void benchmark_thread(LockFreeSkipList<int, int>& list, int thread_id, int ops_per_thread) {
     for (int i = 0; i < ops_per_thread; ++i) {

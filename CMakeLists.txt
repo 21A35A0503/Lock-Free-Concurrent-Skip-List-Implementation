@@ -4,7 +4,8 @@ project(LockFreeSkipList CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(include)
+# Include current root directory
+include_directories(.)
 
-add_executable(benchmark src/main.cpp)
+add_executable(benchmark main.cpp)
 target_link_libraries(benchmark PRIVATE Threads::Threads)
